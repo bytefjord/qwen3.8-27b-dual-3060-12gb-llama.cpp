@@ -92,7 +92,12 @@ Reasoning comes back cleanly separated in `message.reasoning_content`. Defaults 
 4. **q5_1 KV @ 262k does not fit** (misses by less than 1.8GB of headroom).
 5. **Mixed KV types (q8 K + q4 V)** — the standard community recipe for 262k — is impossible on this build: tensor split crashes (bug 1), layer split falls back to CPU (~17 min per test). Should work on stock builds; upstream fixes would unlock a better-quality 262k.
 
-⚠️ These findings are **build-specific**. On stock llama.cpp the numbers and workarounds may differ — re-check before copying.
+⚠️ These findings are **build-specific**. External data point: [Captain-Tripps/qwen38-dual-rtx-3060](https://github.com/Captain-Tripps/qwen38-dual-rtx-3060) runs quantized KV + tensor split fine on a newer build (`b29c606e2`, 131k, q4_0 KV) — so bug 1 is a `b31b71f3a` regression, not llama.cpp-wide. Re-check before copying anything here onto other builds.
+
+## Credits
+
+- The `fast` speed recipe builds on the dual-RTX-3060 work logged by **[Captain-Tripps/qwen38-dual-rtx-3060](https://github.com/Captain-Tripps/qwen38-dual-rtx-3060)** (MIT) and the r/LocalLLaMA thread around it (50.6 tok/s on two 3060s; 52.1 here on 3080 Ti + 3060). Their repo is also the external confirmation that the split bugs above are build-specific.
+- Everything else — the four-tune matrix, the 160k/262k presets, thinking levels, the switching engine, and the bug findings — is original to this repo and was **not** forked from anywhere.
 
 ## Adapting it
 
