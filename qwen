@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# qwen — one-command llama.cpp engine for the 4 Qwen3.8-27B tunes on 2×12GB GPUs
+#
+#   qwen <variant> [max] [off|low|medium|xhigh]
+#
+# Variants (each is a different fine-tune of Qwen3.8-27B, one GGUF each):
+#   fast — base/RVN (uncensored) @ 98k context, MTP, ~52 tok/s
+#   ctx  — base/RVN @ 160k context (q8 KV cache)
+#   pi   — bytkim pi tune @ 98k, MTP; also launches the pi coding agent
+#   cap  — ThinkingCap tune @ 98k (high-volume extraction / classification)
+#   code — Swift tune @ 98k (for opencode / goose coding agents)
+#   max  — base/RVN @ 262144 context (q4_0 KV + layer split)
+#
+#   [max] after a variant  → same tune at 262144 context (e.g. `qwen pi max`)
+#   thinking level         → off | low | medium | xhigh (high = xhigh alias)
+#   Defaults: pi/code = medium, cap = low, fast/ctx/max = off
+#
+# Running server + new command = switch model or reload thinking level.
+# All variants answer under ONE alias, so agent configs (pi/opencode/goose)
+# never need to change. See README.md for benchmarks, bugs and how to adapt.
+
+# ======================== CONFIG — edit this ========================
+MODEL_DIR="${MODEL_DIR:-$HOME/llama.cpp/models/gguf}"
+BIN="${BIN:-$HOME/llama.cpp/build/bin/llama-server}"   # llama-server binary
+LIB_DIR="${LIB_DIR:-$HOME/llama.cpp/lib}"              # CUDA runtime libs (libcudart/libcublas)
+LOG_DIR="${LOG_DIR:-/tmp}"
+PORT="${PORT:-1234}"
+ALIAS="${ALIAS:-qwen3.8-27b}"                          # one alias for ALL variants
+
+# GGUF files (~15GB each, IQ4_XS). Sources in README.md.
+MODEL_FAST="$MODEL_DIR/RVN-IQ4_XS-mtp.gguf"                  # base, uncensored, MTP inside
+MODEL_PI="$MODEL_DIR/bytkim_Qwen3.8-27B-pi-IQ4_XS.gguf"      # pi-agent tune, MTP inside
+MODEL_CAP="$MODEL_DIR/ThinkingCap-Qwen3.8-27B-IQ4_XS.gguf"   # anti-overthinking tune
+MODEL_CODE="$MODEL_DIR/Swift-Qwen3.8-27B-IQ4_XS.gguf"        # coding/agent tune
+# ====================================================================
+
+export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+URL="http://127.0.0.1:$PORT"
+
+# --- state ------------------------------------------------------------
+
+live_llama_pids () {
+  # only live (non-zombie) llama-server processes
+  ps -eo pid=,stat=,comm= | awk '$3=="llama-server" && $2 !~ /^Z/ {print $1}'
+}
+
+zombie_llama_pids () {
+  ps -eo pid=,stat=,comm= | awk '$3=="llama-server" && $2 ~ /^Z/ {print $1}'
+}
+
+server_state () {
+  # down | loading | running  — by live processes + /health
+  local pids
+  pids=$(live_llama_pids)
+  if [ -z "$pids" ]; then echo down; return; fi
+  if curl -s -m 2 "$URL/health" 2>/dev/null | grep -q '"ok"'; then
+    echo running
+  else
+    echo loading
+  fi
+}
+
+variant_of_pid () {
+  # which variant is loaded — by model path + context size in the cmdline
+  local p="$1" cmdline
+  cmdline=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$cmdline" in
+    *bytkim*262144*)         echo pi-max ;;
+    *ThinkingCap*262144*)    echo cap-max ;;
+    *Swift*262144*)          echo code-max ;;
+    *RVN-IQ4_XS-mtp*262144*) echo max ;;
+    *RVN-IQ4_XS-mtp*163840*) echo ctx ;;
+    *RVN-IQ4_XS-mtp*)        echo fast ;;
+    *bytkim*)                echo pi ;;
+    *ThinkingCap*)           echo cap ;;
+    *Swift*)                 echo code ;;
+    *)                       echo "?" ;;
+  esac
+}
+
+think_default () {
+  # thinking level default (arg = BASE variant name)
+  case "${1%-max}" in
+    pi|code) echo medium ;;   # agent loops — medium is the sweet spot
+    cap)     echo low ;;      # ThinkingCap is TRAINED to think; never run it fully off
+    *)       echo off ;;      # fast/ctx/max (base) — speed first
+  esac
+}
+
+think_of_pid () {
+  local p="$1" cmdline
+  cmdline=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$cmdline" in
+    *reasoning_effort*low*)    echo low ;;
+    *reasoning_effort*medium*) echo medium ;;
+    *reasoning_effort*xhigh*)  echo xhigh ;;
+    *)                         echo off ;;
+  esac
+}
+
+parse_args () {
+  # $@ = script args; picks up the max flag and the thinking level
+  MAXMODE=""; THINK=""
+  local a
+  for a in "${@:2}"; do
+    case "$a" in
+      max) MAXMODE=1 ;;
+      off|low|medium|high|xhigh)
+        [ -z "$THINK" ] || { echo "❌ Only one thinking level allowed."; exit 1; }
+        THINK="$a" ;;
+      "") ;;
+      *) echo "❌ Unknown argument: '$a' (allowed: max · off|low|medium|high|xhigh)"; echo; usage; exit 1 ;;
+    esac
+  done
+  [ "$THINK" = high ] && THINK=xhigh   # alias: high → xhigh (Qwen3.8 official levels)
+}
+
+zombie_note () {
+  local zp pp
+  zp=$(zombie_llama_pids | head -1)
+  [ -n "$zp" ] || return 0
+  pp=$(ps -o ppid= -p "$zp" 2>/dev/null | tr -d ' ')
+  echo "ℹ Zombie [llama-server] defunct (PID $zp, parent PID ${pp:-?}, likely an agent that exec'd this server)."
+  echo "  It is dead and harmless — it disappears when you close the parent process."
+}
+
+port_busy_by_other () {
+  ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q . && [ -z "$(live_llama_pids)" ]
+}
+
+# --- stop -------------------------------------------------------------
+
+kill_live () {
+  # TERM → wait → KILL; returns true when nothing is alive
+  local pids i
+  pids=$(live_llama_pids)
+  [ -n "$pids" ] || return 0
+  kill $pids 2>/dev/null
+  for i in $(seq 1 10); do
+    [ -z "$(live_llama_pids)" ] && return 0
+    sleep 1
+  done
+  pids=$(live_llama_pids)
+  kill -9 $pids 2>/dev/null
+  sleep 1
+  [ -z "$(live_llama_pids)" ]
+}
+
+cmd_stop () {
+  local pids
+  pids=$(live_llama_pids)
+  if [ -z "$pids" ]; then
+    echo "ℹ No live qwen server."
+    zombie_note
+    return 0
+  fi
+  echo "⏹ Stopping: PID $(echo $pids | tr '\n' ' ')"
+  if kill_live; then
+    echo "⏹ Stopped."
+  else
+    echo "❌ Processes survive SIGKILL (GPU hang / D-state?):"
+    ps -o pid,stat,comm -p $(live_llama_pids)
+    return 1
+  fi
+  zombie_note
+}
+
+# --- start / switch ---------------------------------------------------
+
+precheck () {
+  local model="$1"
+  [ -x "$BIN" ] || { echo "❌ Missing $BIN — build gone? Rebuild llama.cpp"; return 1; }
+  [ -f "$model" ] || { echo "❌ Missing model file: $model"; return 1; }
+  return 0
+}
+
+model_of_variant () {
+  # a "-max" variant uses the same GGUF as its base
+  local v="${1%-max}"
+  case "$v" in
+    fast) echo "$MODEL_FAST" ;;
+    pi)   echo "$MODEL_PI" ;;
+    cap)  echo "$MODEL_CAP" ;;
+    code) echo "$MODEL_CODE" ;;
+    ctx)  echo "$MODEL_FAST" ;;
+  esac
+}
+
+wait_ready () {
+  local variant="$1" pid="$2" i st
+  for i in $(seq 1 90); do
+    if curl -s -m 2 "$URL/health" 2>/dev/null | grep -q '"ok"'; then
+      echo "✅ Ready ($variant) → $URL/v1/chat/completions"
+      echo "   log: $LOG_DIR/qwen-$variant.log · stop: qwen stop · switch: qwen <other variant>"
+      return 0
+    fi
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -z "$st" ] || [[ "$st" == Z* ]]; then
+      echo "❌ Server died while loading — see: tail -20 $LOG_DIR/qwen-$variant.log"
+      return 1
+    fi
+    sleep 2
+  done
+  echo "⏳ Still loading (~15GB model) — check with: qwen status"
+}
+
+start_variant () {
+  local variant="$1"
+  local log="$LOG_DIR/qwen-$variant.log"
+  local model; model=$(model_of_variant "$variant")
+  echo "▶ Starting: $variant ($ALIAS, thinking: $THINK)..."
+  # Thinking level is applied through chat_template_kwargs ON TOP of -rea off,
+  # so clients can still override it per-request. Verified: kwargs win.
+  local rea_args=()
+  case "$THINK" in
+    off) rea_args=(-rea off) ;;
+    *)   rea_args=(-rea off --chat-template-kwargs "{\"enable_thinking\": true, \"reasoning_effort\": \"$THINK\"}") ;;
+  esac
+  case "$variant" in
+    *-max)
+      # 262144 (model's native max). q4_0 KV + layer split are REQUIRED on
+      # the tested build: tensor split crashes on quantized KV (split-axis
+      # assert in ggml-backend-meta.cpp) and auto-fit aborts on tensor mode.
+      # MTP draft doesn't fit next to a 262k KV on 24GB — hence no MTP here.
+      nohup env GGML_CUDA_DISABLE_GRAPHS=1 "$BIN" \
+        -m "$model" --alias "$ALIAS" \
+        -c 262144 -ngl 99 -sm layer -fa on \
+        -ctk q4_0 -ctv q4_0 \
+        -b 256 -ub 64 --jinja "${rea_args[@]}" -fit off \
+        --port "$PORT" --metrics \
+        > "$log" 2>&1 &
+      ;;
+    fast|pi)
+      # RVN and bytkim GGUFs have the MTP draft embedded
+      nohup env GGML_CUDA_DISABLE_GRAPHS=1 "$BIN" \
+        -m "$model" --alias "$ALIAS" \
+        -c 98304 -b 256 -ub 64 -ngl 99 -sm tensor -ts 1/1 -fa on \
+        -ctk q8_0 -ctv q8_0 \
+        --spec-type draft-mtp --spec-draft-n-max 2 -ngld 99 -ctkd q4_0 -ctvd q4_0 \
+        --jinja "${rea_args[@]}" \
+        --port "$PORT" --metrics \
+        > "$log" 2>&1 &
+      ;;
+    ctx)
+      nohup env GGML_CUDA_DISABLE_GRAPHS=1 "$BIN" \
+        -m "$model" --alias "$ALIAS" \
+        -c 163840 -ngl 99 -sm tensor -ts 1/1 -fa on \
+        -ctk q8_0 -ctv q8_0 \
+        --jinja "${rea_args[@]}" \
+        --port "$PORT" --metrics \
+        > "$log" 2>&1 &
+      ;;
+    cap|code)
+      nohup env GGML_CUDA_DISABLE_GRAPHS=1 "$BIN" \
+        -m "$model" --alias "$ALIAS" \
+        -c 98304 -b 256 -ub 64 -ngl 99 -sm tensor -ts 1/1 -fa on \
+        -ctk q8_0 -ctv q8_0 \
+        --jinja "${rea_args[@]}" \
+        --port "$PORT" --metrics \
+        > "$log" 2>&1 &
+      ;;
+  esac
+  wait_ready "$variant" "$!"
+}
+
+switch_or_start () {
+  local variant="$1" cur ct st
+  precheck "$(model_of_variant "$variant")" || exit 1
+  [ -n "$THINK" ] || THINK=$(think_default "$variant")
+
+  st=$(server_state)
+  case "$st" in
+    loading)
+      echo "ℹ Server is still loading — wait (qwen status) or qwen stop"; exit 1 ;;
+    running)
+      cur=$(variant_of_pid "$(live_llama_pids | head -1)")
+      ct=$(think_of_pid "$(live_llama_pids | head -1)")
+      if [ "$cur" = "$variant" ] && [ "$ct" = "$THINK" ]; then
+        echo "ℹ Already running $variant (thinking: $ct) — nothing to do (qwen status)"
+        return 0
+      fi
+      if [ "$cur" = "$variant" ]; then
+        echo "⟳ Reloading with new thinking level: $cur($ct) → $variant($THINK)..."
+      else
+        echo "⇄ Switching model: $cur($ct) → $variant($THINK) (unload + load, ~30–40s)..."
+      fi
+      kill_live || { echo "❌ Old server refused to die — see qwen status"; exit 1; }
+      ;;
+    down)
+      if port_busy_by_other; then
+        echo "❌ Port $PORT is taken by another process (not llama-server):"
+        ss -tlnp "sport = :$PORT" 2>/dev/null
+        exit 1
+      fi
+      zombie_note
+      ;;
+  esac
+  start_variant "$variant"
+}
+
+# --- management -------------------------------------------------------
+
+cmd_status () {
+  local st cur ct pids
+  st=$(server_state)
+  case "$st" in
+    running)
+      pids=$(live_llama_pids)
+      cur=$(variant_of_pid "${pids%% *}")
+      ct=$(think_of_pid "${pids%% *}")
+      echo "● Running: variant $cur · thinking: $ct ($ALIAS)"
+      curl -s -m 2 "$URL/health" | head -c 120; echo
+      echo "Switch/level: qwen pi|cap|code|max [max] [off|low|medium|xhigh] · Stop: qwen stop"
+      echo "VRAM:"; nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+      grep -a 'print_timing' "$LOG_DIR"/qwen-*.log 2>/dev/null | grep 'eval time' | tail -1 \
+        | grep -oE '[0-9.]+ tokens per second' | sed 's/^/Last t\/s: /'
+      ;;
+    loading)
+      echo "◐ Still loading (~15GB model) — check the newest log:"
+      ls -t "$LOG_DIR"/qwen-*.log 2>/dev/null | head -1
+      ;;
+    down)
+      echo "○ Stopped. Start/switch: qwen fast|ctx|pi|cap|code|max [max] [level]"
+      port_busy_by_other && { echo "⚠ WARNING: port $PORT is taken by another process (not llama-server):"; ss -tlnp "sport = :$PORT" 2>/dev/null; }
+      ;;
+  esac
+  zombie_note
+}
+
+usage () {
+  echo "Usage: qwen <variant> [max] [off|low|medium|xhigh] | stop | status | log [variant]"
+  echo ""
+  echo "  Variants (Qwen3.8-27B tunes, ~15GB IQ4_XS GGUF each):"
+  echo "  fast   — RVN base (uncensored) @ 98k, MTP, ~52 tok/s · thinking: off"
+  echo "  ctx    — RVN @ 160k (q8 KV)                          · thinking: off"
+  echo "  pi     — bytkim pi tune @ 98k, MTP + launches pi agent · thinking: medium"
+  echo "  cap    — ThinkingCap @ 98k (extraction)               · thinking: low"
+  echo "  code   — Swift @ 98k (opencode/goose agents)          · thinking: medium"
+  echo "  max    — RVN @ 262k (q4 KV, layer split)              · thinking: off"
+  echo ""
+  echo "  Combos: qwen pi max · qwen code max low · qwen cap high · qwen pi xhigh max …"
+  echo "  max flag = 262144 context · high = xhigh (Qwen3.8 levels: low/medium/xhigh)"
+  echo "  Running server + new command = switch/reload, no manual stop."
+  echo "  All variants answer under the alias '$ALIAS' — agent configs never change."
+}
+
+case "${1:-}" in
+  fast|ctx|cap|code|pi)
+    parse_args "$@"
+    THINK="${THINK:-$(think_default "$1")}"
+    switch_or_start "$1${MAXMODE:+-max}"
+    [ "$1" = "pi" ] && { echo "▶ Launching pi agent..."; exec pi; } ;;
+  max)
+    parse_args "$@"
+    THINK="${THINK:-$(think_default max)}"
+    switch_or_start max ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  log)    tail -f "$LOG_DIR/qwen-${2:-fast}.log" ;;
+  *)      usage ;;
+esac
