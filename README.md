@@ -16,14 +16,14 @@ Tested hardware: **RTX 3080 Ti (12GB) + RTX 3060 (12GB)**, llama.cpp build `b31b
 
 ## The idea: four tunes, four jobs
 
-Qwen3.8-27B fine-tunes that **cut thinking tokens dramatically while giving the same answers**:
+All four are fine-tunes of the **same Qwen3.8-27B** — they do the same tasks as the original model, but with **2–4× fewer thinking tokens for the same answers** (measured by their trainers: ThinkingCap −37%, Swift −58% on GPQA/LiveCodeBench; pi finishes a task with ≈4,650 thinking tokens vs ≈8,300 for the base). Each tune exists for a different job:
 
-| Variant | Fine-tune | What it's for | Thinking default |
-|---|---|---|---|
-| `fast` / `ctx` / `max` | **RVN** — Heretic-uncensored base ([source](https://huggingface.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF)) | general work, where refusals hurt; the accuracy reference for long autonomous runs | off |
-| `pi` | **[bytkim/Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi)** — SFT+GRPO on successful [pi coding agent](https://github.com/badlogic/pi) sessions | the pi agent: repo reading, file edits, tool loops. Cuts thinking from **~8,300 to ~4,650 tokens per task**, and at `medium` effort it still matches the base model's `xhigh` quality — in practice **2–3× less thinking for the same result** | medium |
-| `cap` | **[ThinkingCap-Qwen3.8-27B](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B)** — anti-overthinking tune (−37% reasoning tokens) | high-volume repetitive reasoning: extraction, classification, text-to-SQL; best long-context recall (+2.3pp) | **low** |
-| `code` | **[Swift-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-Qwen3.8-27b)** (−58% thinking tokens, ~2× faster, LiveCodeBench 77→82) | interactive coding agents (opencode, goose) | medium |
+| Variant | Exact GGUF file (on disk, ~15GB each) | Upstream fine-tune | Built for | Thinking default |
+|---|---|---|---|---|
+| `fast` / `ctx` / `max` | `RVN-IQ4_XS-mtp.gguf` | [0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF](https://huggingface.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF) | **The Heretic-uncensored base** — general-purpose work where refusals hurt; the accuracy reference for long autonomous runs | off |
+| `pi` | `bytkim_Qwen3.8-27B-pi-IQ4_XS.gguf` | [bytkim/Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi) | **Built specifically for the pi coding agent** — SFT+GRPO on successful pi sessions: repo reading, file edits, tool loops. ≈4,650 vs ≈8,300 thinking tokens per task; at `medium` it still matches the base model's `xhigh` quality | medium |
+| `cap` | `ThinkingCap-Qwen3.8-27B-IQ4_XS.gguf` | [bottlecapai/ThinkingCap-Qwen3.8-27B](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B) | **General work that needs brief thinking** — research, extraction, classification, text-to-SQL; best long-context recall (+2.3pp). −37% reasoning tokens, same answers | **low** |
+| `code` | `Swift-Qwen3.8-27B-IQ4_XS.gguf` | [ukisai/Swift-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-Qwen3.8-27b) | **Built for the other coding agents** (opencode, goose) — −58% thinking tokens, ~2× faster, LiveCodeBench 77→82 | medium |
 
 **Don't like the pi agent?** Point opencode or goose at the same server alias and run `qwen code` (Swift) — the one-alias design below means zero config changes. The tunes exist to make the SAME model faster at specific jobs; pick per job.
 
