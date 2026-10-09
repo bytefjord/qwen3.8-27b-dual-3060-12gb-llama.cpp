@@ -2,6 +2,8 @@
 
 All numbers measured on the author's machine: RTX 3080 Ti (12GB, PCIe x16) + RTX 3060 (12GB, PCIe x4), llama.cpp build `b31b71f3a` (2026-09-09, CUDA 13), GGUF **IQ4_XS ~14.6–15.5GB**, flash attention on, `-b 256 -ub 64`.
 
+**Should transfer to dual RTX 3060 12GB** (the target build): a dual-3060 setup reported 50.6 tok/s on the same speed recipe vs 52.1 here (r/LocalLLaMA) — the slower card bounds the pipeline either way, and both cards are Ampere compute capability 8.6 with 12GB.
+
 The model: **Qwen3.8-27B**, hybrid qwen35 architecture — 65 blocks (full attention on every 4th layer + 48 Mamba/SSM layers), MTP (NextN) draft embedded in some GGUFs, native context **262,144**. Because only ~17 layers carry attention KV, the cache is tiny: **~36 KB/token at q8_0, ~18 KB/token at q4_0** — that's why 262k fits at all.
 
 Realistic prompt test: **94,164-token** real book text with a needle placed at 62% depth, 256 max output tokens, via the OpenAI API.

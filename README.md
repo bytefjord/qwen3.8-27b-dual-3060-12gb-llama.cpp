@@ -1,4 +1,4 @@
-# qwen — one-command llama.cpp engine for Qwen3.8-27B on 2×12GB GPUs
+# qwen — Qwen3.8-27B engine for two 12GB GPUs (2× RTX 3060 class)
 
 Run **4 different Qwen3.8-27B fine-tunes** (base/uncensored, pi, ThinkingCap, Swift) through a single llama.cpp server with **one command each** — including model switching, three context presets (98k / 160k / **262k**), and per-variant **thinking levels** (off/low/medium/xhigh).
 
@@ -8,20 +8,24 @@ qwen cap                 # ThinkingCap, 98k, low thinking (extraction)
 qwen code max low        # Swift tune, 262k, light thinking
 ```
 
-Tested setup: **RTX 3080 Ti (12GB) + RTX 3060 (12GB) = 24GB VRAM**, llama.cpp build `b31b71f3a` (2026-09-09, CUDA), GGUF **IQ4_XS ~15GB** per model. Everything below is measured on this exact hardware — see [BENCHMARKS.md](BENCHMARKS.md).
+**The point: real agentic work in a home lab on two 12GB cards.** Two RTX 3060 12GB run the pi coding agent on the `pi` tune all day, opencode/goose on the `code` tune, and full **262k-token document work on ~22.5GB of VRAM** — at the speeds measured below. This exact setup ran as a daily production machine, not a demo.
+
+Tested hardware: **RTX 3080 Ti (12GB) + RTX 3060 (12GB)**, llama.cpp build `b31b71f3a` (2026-09-09, CUDA), GGUF **IQ4_XS ~15GB** per model. A dual-RTX-3060-12GB setup reported nearly identical speed on the same recipe (50.6 vs 52.1 tok/s, r/LocalLLaMA) — expect essentially the same results on two 3060s. Everything is measured — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
 ## The idea: four tunes, four jobs
 
-Qwen3.8-27B fine-tunes that **cut thinking tokens by ~37–58% while giving the same answers** (measured by their trainers on GPQA/LiveCodeBench):
+Qwen3.8-27B fine-tunes that **cut thinking tokens dramatically while giving the same answers**:
 
 | Variant | Fine-tune | What it's for | Thinking default |
 |---|---|---|---|
 | `fast` / `ctx` / `max` | **RVN** — Heretic-uncensored base ([source](https://huggingface.co/0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF)) | general work, where refusals hurt; the accuracy reference for long autonomous runs | off |
-| `pi` | **[bytkim/Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi)** — SFT+GRPO on successful [pi coding agent](https://github.com/badlogic/pi) sessions | the pi agent: repo reading, file edits, tool loops. At `medium` it matches the base model's `xhigh` quality with **41% fewer tokens** | medium |
+| `pi` | **[bytkim/Qwen3.8-27B-pi](https://huggingface.co/bytkim/Qwen3.8-27B-pi)** — SFT+GRPO on successful [pi coding agent](https://github.com/badlogic/pi) sessions | the pi agent: repo reading, file edits, tool loops. Cuts thinking from **~8,300 to ~4,650 tokens per task**, and at `medium` effort it still matches the base model's `xhigh` quality — in practice **2–3× less thinking for the same result** | medium |
 | `cap` | **[ThinkingCap-Qwen3.8-27B](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B)** — anti-overthinking tune (−37% reasoning tokens) | high-volume repetitive reasoning: extraction, classification, text-to-SQL; best long-context recall (+2.3pp) | **low** |
 | `code` | **[Swift-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-Qwen3.8-27b)** (−58% thinking tokens, ~2× faster, LiveCodeBench 77→82) | interactive coding agents (opencode, goose) | medium |
+
+**Don't like the pi agent?** Point opencode or goose at the same server alias and run `qwen code` (Swift) — the one-alias design below means zero config changes. The tunes exist to make the SAME model faster at specific jobs; pick per job.
 
 ⚠️ **Don't run the thinking tunes with thinking fully off.** ThinkingCap was trained *with* thinking — disabling it entirely costs **−34pp** accuracy (the single biggest quality drop of any setting). The defaults in this script follow each tune's training: extraction tunes get `low`, agent tunes get `medium`, the base gets `off` for raw speed.
 
