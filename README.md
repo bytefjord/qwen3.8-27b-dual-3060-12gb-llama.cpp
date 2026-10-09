@@ -68,6 +68,29 @@ Rules:
 
 The 262k preset is the interesting one: the model is a **hybrid** (17 full-attention + 48 Mamba/SSM layers), so KV is only ~18 KB/token at q4_0 → 262k fits with ~1.8GB to spare. A 94,164-token needle-in-haystack test (needle at 62% depth) passes. Two build-specific workarounds are mandatory there — see the bugs section.
 
+### The exact launch flags behind each preset (copy-paste)
+
+All: `GGML_CUDA_DISABLE_GRAPHS=1`, `-ngl 99 -fa on --jinja -rea off --port 1234 --metrics`.
+
+**fast (MTP, 98k → ~52 tok/s):**
+```
+-c 98304 -b 256 -ub 64 -sm tensor -ts 1/1 -ctk q8_0 -ctv q8_0 \
+--spec-type draft-mtp --spec-draft-n-max 2 -ngld 99 -ctkd q4_0 -ctvd q4_0
+```
+(RVN and bytkim GGUFs have the MTP draft embedded — ThinkingCap/Swift don't.)
+
+**ctx (160k — the q8 KV ceiling on this build):**
+```
+-c 163840 -sm tensor -ts 1/1 -ctk q8_0 -ctv q8_0
+```
+
+**max (262k → fits at 22.5GB):**
+```
+-c 262144 -b 256 -ub 64 -sm layer -ctk q4_0 -ctv q4_0 -fit off
+```
+
+Thinking level goes over `-rea off` as request-side/template data (see next section). The script wraps all of this — these are the raw flags if you'd rather roll your own.
+
 ## Thinking levels — how they work
 
 The server starts with `-rea off` (template-level default) and thinking is enabled via:
