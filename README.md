@@ -41,6 +41,7 @@ qwen <variant> [max] [off|low|medium|xhigh]
   cap             # ThinkingCap @ 98k                 (thinking: low)
   code            # Swift @ 98k                       (thinking: medium)
   max             # base @ 262k, q4 KV                (thinking: off)
+  vision          # base @ 98k + mmproj → IMAGE input (thinking: off)
 
   pi max          # pi tune @ 262k                    (thinking: medium)
   code max low    # Swift @ 262k, light thinking
@@ -88,6 +89,19 @@ All: `GGML_CUDA_DISABLE_GRAPHS=1`, `-ngl 99 -fa on --jinja -rea off --port 1234 
 ```
 -c 262144 -b 256 -ub 64 -sm layer -ctk q4_0 -ctv q4_0 -fit off
 ```
+
+**vision (image input — fast flags minus MTP, plus the projector):**
+```
+-m <base.gguf> --mmproj mmproj-Qwen3.8-27B-Q5_K-MIX.gguf \
+-c 98304 -b 256 -ub 64 -sm tensor -ts 1/1 -ctk q8_0 -ctv q8_0
+```
+mmproj is a separate 347MB file (`~/llama.cpp/models/gguf/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf`,
+from [HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF](https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF);
+it belongs to the BASE model — the fine-tunes only touch language layers, so it works with
+any of them if you point `--mmproj` at their GGUF). No MTP here — the draft head doesn't
+earn its VRAM next to the projector. Images go through the OpenAI-compatible API as
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` content parts.
+First use of the variant without the file: the script prints the one-line curl to fetch it.
 
 Thinking level goes over `-rea off` as request-side/template data (see next section). The script wraps all of this — these are the raw flags if you'd rather roll your own.
 

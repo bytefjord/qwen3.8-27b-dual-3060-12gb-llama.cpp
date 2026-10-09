@@ -10,6 +10,8 @@
 #   cap  — ThinkingCap tune @ 98k (high-volume extraction / classification)
 #   code — Swift tune @ 98k (for opencode / goose coding agents)
 #   max  — base/RVN @ 262144 context (q4_0 KV + layer split)
+#   vision — base/RVN @ 98k + mmproj (IMAGE INPUT: screenshot/OCR/filmstrip judging;
+#            no MTP — the draft head doesn't earn its VRAM next to the projector)
 #
 #   [max] after a variant  → same tune at 262144 context (e.g. `qwen pi max`)
 #   thinking level         → off | low | medium | xhigh (high = xhigh alias)
@@ -32,6 +34,9 @@ MODEL_FAST="$MODEL_DIR/RVN-IQ4_XS-mtp.gguf"                  # base, uncensored,
 MODEL_PI="$MODEL_DIR/bytkim_Qwen3.8-27B-pi-IQ4_XS.gguf"      # pi-agent tune, MTP inside
 MODEL_CAP="$MODEL_DIR/ThinkingCap-Qwen3.8-27B-IQ4_XS.gguf"   # anti-overthinking tune
 MODEL_CODE="$MODEL_DIR/Swift-Qwen3.8-27B-IQ4_XS.gguf"        # coding/agent tune
+# vision projector (separate file by design in llama.cpp; from the BASE model —
+# the fine-tunes only touch language layers, the ViT/projector is untouched)
+MMPROJ="$MODEL_DIR/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf"
 # ====================================================================
 
 export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -70,6 +75,7 @@ variant_of_pid () {
     *Swift*262144*)          echo code-max ;;
     *RVN-IQ4_XS-mtp*262144*) echo max ;;
     *RVN-IQ4_XS-mtp*163840*) echo ctx ;;
+    *mmproj*)                echo vision ;;
     *RVN-IQ4_XS-mtp*)        echo fast ;;
     *bytkim*)                echo pi ;;
     *ThinkingCap*)           echo cap ;;
@@ -83,7 +89,7 @@ think_default () {
   case "${1%-max}" in
     pi|code) echo medium ;;   # agent loops — medium is the sweet spot
     cap)     echo low ;;      # ThinkingCap is TRAINED to think; never run it fully off
-    *)       echo off ;;      # fast/ctx/max (base) — speed first
+    *)       echo off ;;      # fast/ctx/max/vision (base) — speed first
   esac
 }
 
@@ -171,6 +177,13 @@ precheck () {
   local model="$1"
   [ -x "$BIN" ] || { echo "❌ Missing $BIN — build gone? Rebuild llama.cpp"; return 1; }
   [ -f "$model" ] || { echo "❌ Missing model file: $model"; return 1; }
+  if [ "${2:-}" = need-mmproj ] && [ ! -f "$MMPROJ" ]; then
+    echo "❌ Missing mmproj: $MMPROJ"
+    echo "   Download it once:"
+    echo "   curl -L -o '$MMPROJ' \\"
+    echo "     'https://huggingface.co/HermiHg/Qwen3.8-27B-mmproj-Q5_K-MIX-GGUF/resolve/main/mmproj-Qwen3.8-27B-Q5_K-MIX.gguf'"
+    return 1
+  fi
   return 0
 }
 
@@ -178,11 +191,12 @@ model_of_variant () {
   # a "-max" variant uses the same GGUF as its base
   local v="${1%-max}"
   case "$v" in
-    fast) echo "$MODEL_FAST" ;;
-    pi)   echo "$MODEL_PI" ;;
-    cap)  echo "$MODEL_CAP" ;;
-    code) echo "$MODEL_CODE" ;;
-    ctx)  echo "$MODEL_FAST" ;;
+    fast)   echo "$MODEL_FAST" ;;
+    pi)     echo "$MODEL_PI" ;;
+    cap)    echo "$MODEL_CAP" ;;
+    code)   echo "$MODEL_CODE" ;;
+    ctx)    echo "$MODEL_FAST" ;;
+    vision) echo "$MODEL_FAST" ;;
   esac
 }
 
@@ -259,13 +273,26 @@ start_variant () {
         --port "$PORT" --metrics \
         > "$log" 2>&1 &
       ;;
+    vision)
+      # fast flags minus MTP (no VRAM for the draft head next to the projector)
+      nohup env GGML_CUDA_DISABLE_GRAPHS=1 "$BIN" \
+        -m "$model" --mmproj "$MMPROJ" --alias "$ALIAS" \
+        -c 98304 -b 256 -ub 64 -ngl 99 -sm tensor -ts 1/1 -fa on \
+        -ctk q8_0 -ctv q8_0 \
+        --jinja "${rea_args[@]}" \
+        --port "$PORT" --metrics \
+        > "$log" 2>&1 &
+      ;;
   esac
   wait_ready "$variant" "$!"
 }
 
 switch_or_start () {
   local variant="$1" cur ct st
-  precheck "$(model_of_variant "$variant")" || exit 1
+  case "$variant" in
+    vision) precheck "$(model_of_variant "$variant")" need-mmproj || exit 1 ;;
+    *)      precheck "$(model_of_variant "$variant")" || exit 1 ;;
+  esac
   [ -n "$THINK" ] || THINK=$(think_default "$variant")
 
   st=$(server_state)
@@ -337,6 +364,7 @@ usage () {
   echo "  cap    — ThinkingCap @ 98k (extraction)               · thinking: low"
   echo "  code   — Swift @ 98k (opencode/goose agents)          · thinking: medium"
   echo "  max    — RVN @ 262k (q4 KV, layer split)              · thinking: off"
+  echo "  vision — RVN @ 98k + mmproj → IMAGE input (no MTP)    · thinking: off"
   echo ""
   echo "  Combos: qwen pi max · qwen code max low · qwen cap high · qwen pi xhigh max …"
   echo "  max flag = 262144 context · high = xhigh (Qwen3.8 levels: low/medium/xhigh)"
@@ -345,7 +373,7 @@ usage () {
 }
 
 case "${1:-}" in
-  fast|ctx|cap|code|pi)
+  fast|ctx|cap|code|pi|vision)
     parse_args "$@"
     THINK="${THINK:-$(think_default "$1")}"
     switch_or_start "$1${MAXMODE:+-max}"
